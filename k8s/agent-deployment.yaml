@@ -1,0 +1,141 @@
+# The article's manifest, with the parts a running service needs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devops-agent
+  namespace: platform-tools
+spec:
+  # Single replica: the agent holds MCP server subprocesses and a SQLite
+  # approval store on a local volume. Scaling out means moving both the
+  # approval store and the run ledger to Postgres first — see store.py.
+  replicas: 1
+  strategy:
+    type: Recreate          # two replicas must never share the SQLite volume
+  selector:
+    matchLabels: { app: devops-agent }
+  template:
+    metadata:
+      labels: { app: devops-agent }
+    spec:
+      serviceAccountName: devops-agent-sa
+      # Long enough for an in-flight run to finish rather than be cut off
+      # mid-write; drain_timeout must be comfortably under this.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: agent
+          image: ghcr.io/yourorg/devops-agent:latest
+          command: ["uvicorn", "agentic_devops.main:app", "--host", "0.0.0.0", "--port", "8080"]
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            - name: ANTHROPIC_API_KEY
+              valueFrom: { secretKeyRef: { name: ai-credentials, key: anthropic-api-key } }
+            - name: SLACK_BOT_TOKEN
+              valueFrom: { secretKeyRef: { name: slack-credentials, key: bot-token } }
+            # Without this the Approve buttons are unauthenticated, and anyone
+            # who can reach the pod can approve a production write.
+            - name: SLACK_SIGNING_SECRET
+              valueFrom: { secretKeyRef: { name: slack-credentials, key: signing-secret } }
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom: { secretKeyRef: { name: webhook-secrets, key: github } }
+            - name: PAGERDUTY_WEBHOOK_SECRET
+              valueFrom: { secretKeyRef: { name: webhook-secrets, key: pagerduty } }
+            - name: SLACK_APPROVAL_CHANNEL
+              value: "#infra-approvals"
+            - name: APPROVALS_DB
+              value: /data/approvals.db
+            - name: RUNS_DB
+              value: /data/runs.db
+            - name: MCP_SERVERS_FILE
+              value: /etc/agent/servers.json
+            - name: AGENT_WORKERS
+              value: "2"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability:4317
+            - name: OTEL_SERVICE_NAME
+              value: devops-agent
+            - name: DEPLOY_ENV
+              value: production
+            # Tool arguments and incident text stay out of traces unless this
+            # is deliberately switched on. See observability/redaction.py.
+            - name: OTEL_RECORD_PAYLOADS
+              value: "false"
+            - name: KNOWLEDGE_DB
+              value: /data/knowledge.db
+            - name: TRANSCRIPTS_DB
+              value: /data/transcripts.db
+          volumeMounts:
+            - { name: state, mountPath: /data }
+            - { name: servers, mountPath: /etc/agent, readOnly: true }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          readinessProbe:
+            # Reports not-ready until the MCP servers are connected and the
+            # worker pool is up, so no webhook is accepted before it can run.
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits:   { cpu: 1000m, memory: 2Gi }
+      volumes:
+        - name: state
+          persistentVolumeClaim: { claimName: devops-agent-state }
+        - name: servers
+          configMap: { name: devops-agent-mcp-servers }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: devops-agent-state
+  namespace: platform-tools
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 1Gi }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: devops-agent-mcp-servers
+  namespace: platform-tools
+data:
+  servers.json: |
+    {
+      "servers": [
+        {"name": "kubernetes", "command": "kubernetes-mcp", "args": ["--readonly-discovery"]},
+        {"name": "github", "command": "github-mcp"},
+        {"name": "datadog", "url": "https://mcp.internal.example.com/datadog"}
+      ]
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: devops-agent
+  namespace: platform-tools
+spec:
+  selector: { app: devops-agent }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+# Read-only at the cluster level. Writes go through MCP servers holding their
+# own narrower credentials, so a bug in the agent cannot widen its own access.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: devops-agent-readonly
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: devops-agent-sa
+    namespace: platform-tools
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: devops-agent-sa
+  namespace: platform-tools
