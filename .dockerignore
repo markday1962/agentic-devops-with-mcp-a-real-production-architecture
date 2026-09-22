@@ -1,0 +1,27 @@
+.git
+.gitignore
+.github
+
+# Article source, not part of the runtime image
+*.pdf
+k8s/
+README.md
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local/dev state that must never end up baked into a layer
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+
+# Not needed at runtime; keeps the build context and image lean
+tests/
