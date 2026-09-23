@@ -7,3 +7,5 @@ __pycache__/
 *.db-wal
 *.db-shm
 .ruff_cache
+.env
+.env.*
